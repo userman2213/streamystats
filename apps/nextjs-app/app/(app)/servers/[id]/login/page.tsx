@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { Suspense } from "react";
 import { Skeleton } from "@/components/ui/skeleton";
+import { getQuickConnectAvailability } from "@/lib/auth";
 import { getServer, getServers } from "@/lib/db/server";
 import { SignInForm } from "./SignInForm";
 
@@ -25,7 +26,17 @@ async function LoginContent({ params }: { params: Promise<{ id: string }> }) {
     redirect("/not-found");
   }
 
-  return <SignInForm server={server} servers={servers} />;
+  const quickConnectEnabled = await getQuickConnectAvailability({
+    serverId: server.id,
+  });
+
+  return (
+    <SignInForm
+      server={server}
+      servers={servers}
+      quickConnectEnabled={quickConnectEnabled}
+    />
+  );
 }
 
 function LoginSkeleton() {
