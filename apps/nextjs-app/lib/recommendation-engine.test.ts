@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
   aggregateGraphScores,
+  applyNegativeSignals,
   cosineSimilarity,
   decadeAffinity,
   diversify,
   EDGE_TYPE_WEIGHTS,
   genreAffinity,
+  mergeAnchors,
   ratingAffinity,
   scoreCandidates,
 } from "./recommendation-engine";
@@ -214,5 +216,65 @@ describe("diversify", () => {
       make("c", 0.7, "C"),
     ];
     expect(diversify(candidates, (c) => c.genre, 2)).toHaveLength(2);
+  });
+});
+
+describe("applyNegativeSignals", () => {
+  const scored = (id: string, score: number) => ({
+    itemId: id,
+    score,
+    contributions: [],
+  });
+
+  test("penalizes candidates close to hidden items, proportionally", () => {
+    const result = applyNegativeSignals(
+      [scored("a", 0.8), scored("b", 0.8), scored("c", 0.8)],
+      new Map([
+        ["a", 1.0],
+        ["b", 0.5],
+      ]),
+      0.7,
+    );
+    const byId = new Map(result.map((r) => [r.itemId, r.score]));
+    expect(byId.get("a")).toBeCloseTo(0.8 * (1 - 0.7));
+    expect(byId.get("b")).toBeCloseTo(0.8 * (1 - 0.35));
+    expect(byId.get("c")).toBeCloseTo(0.8);
+  });
+
+  test("no-op with empty or non-positive negative scores", () => {
+    const input = [scored("a", 0.5)];
+    expect(applyNegativeSignals(input, new Map())[0].score).toBe(0.5);
+    expect(applyNegativeSignals(input, new Map([["a", 0]]))[0].score).toBe(0.5);
+  });
+});
+
+describe("mergeAnchors", () => {
+  test("recent anchors join and win on duplicates via max weight", () => {
+    const merged = mergeAnchors(
+      [
+        { itemId: "p1", weight: 0.9 },
+        { itemId: "shared", weight: 0.4 },
+      ],
+      [
+        { itemId: "shared", weight: 0.95 },
+        { itemId: "r1", weight: 1.0 },
+      ],
+    );
+    const byId = new Map(merged.map((a) => [a.itemId, a.weight]));
+    expect(byId.get("shared")).toBe(0.95);
+    expect(byId.get("r1")).toBe(1.0);
+    expect(byId.get("p1")).toBe(0.9);
+    // Sorted strongest-first
+    expect(merged[0].itemId).toBe("r1");
+  });
+
+  test("caps to maxAnchors keeping the strongest", () => {
+    const many = Array.from({ length: 30 }, (_, i) => ({
+      itemId: `a${i}`,
+      weight: i / 30,
+    }));
+    const merged = mergeAnchors(many, [], 5);
+    expect(merged).toHaveLength(5);
+    expect(merged[0].itemId).toBe("a29");
   });
 });

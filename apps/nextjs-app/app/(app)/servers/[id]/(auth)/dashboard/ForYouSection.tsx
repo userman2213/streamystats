@@ -1,7 +1,11 @@
 "use client";
 
 import { Sparkles } from "lucide-react";
-import { getForYouRecommendations } from "@/lib/db/recommendations";
+import { useEffect, useState } from "react";
+import {
+  getForYouRecommendations,
+  refineForYouRecommendations,
+} from "@/lib/db/recommendations";
 import type { ForYouRecommendation } from "@/lib/db/recommendations-core";
 import { hideRecommendation } from "@/lib/db/similar-statistics";
 import type { ServerPublic } from "@/lib/types";
@@ -26,51 +30,82 @@ const formatRuntime = (ticks: number | null) => {
   return `${minutes}m`;
 };
 
-export const ForYouMovies = ({ data, server }: Props) => {
+function ForYouRow({
+  data,
+  server,
+  mediaType,
+  title,
+  emptyMessage,
+  withRuntime,
+}: Props & {
+  mediaType: "Movie" | "Series";
+  title: string;
+  emptyMessage: string;
+  withRuntime?: boolean;
+}) {
+  const [recommendations, setRecommendations] = useState(data);
+
+  useEffect(() => {
+    setRecommendations(data);
+  }, [data]);
+
+  // Best-effort LLM refinement: render the engine order immediately, then
+  // swap in the chat model's ordering and explanations when available
+  useEffect(() => {
+    let active = true;
+    refineForYouRecommendations({ serverId: server.id, mediaType })
+      .then((result) => {
+        if (active && result.refined && result.items.length > 0) {
+          setRecommendations(result.items);
+        }
+      })
+      .catch(() => {
+        // Keep the engine ordering on any failure
+      });
+    return () => {
+      active = false;
+    };
+  }, [server.id, mediaType]);
+
   const fetchNextPage = async (offset: number) => {
     return getForYouRecommendations({
       serverId: server.id,
-      mediaType: "Movie",
+      mediaType,
       offset,
     });
   };
 
   return (
     <RecommendationsSection
-      title="Movies For You"
+      title={title}
       description="Personalized picks from your taste profile, viewing patterns, and library connections"
       icon={Sparkles}
-      recommendations={data}
+      recommendations={recommendations}
       server={server}
       onHideRecommendation={hideRecommendation}
-      formatRuntime={formatRuntime}
-      emptyMessage="Watch a few movies and recommendations will appear here"
+      formatRuntime={withRuntime ? formatRuntime : undefined}
+      emptyMessage={emptyMessage}
       fetchNextPage={fetchNextPage}
       requiresEmbeddings={false}
     />
   );
-};
+}
 
-export const ForYouSeries = ({ data, server }: Props) => {
-  const fetchNextPage = async (offset: number) => {
-    return getForYouRecommendations({
-      serverId: server.id,
-      mediaType: "Series",
-      offset,
-    });
-  };
+export const ForYouMovies = (props: Props) => (
+  <ForYouRow
+    {...props}
+    mediaType="Movie"
+    title="Movies For You"
+    emptyMessage="Watch a few movies and recommendations will appear here"
+    withRuntime
+  />
+);
 
-  return (
-    <RecommendationsSection
-      title="Series For You"
-      description="Personalized picks from your taste profile, viewing patterns, and library connections"
-      icon={Sparkles}
-      recommendations={data}
-      server={server}
-      onHideRecommendation={hideRecommendation}
-      emptyMessage="Watch a few series and recommendations will appear here"
-      fetchNextPage={fetchNextPage}
-      requiresEmbeddings={false}
-    />
-  );
-};
+export const ForYouSeries = (props: Props) => (
+  <ForYouRow
+    {...props}
+    mediaType="Series"
+    title="Series For You"
+    emptyMessage="Watch a few series and recommendations will appear here"
+  />
+);

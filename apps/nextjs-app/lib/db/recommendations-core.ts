@@ -20,14 +20,19 @@ import {
   notInArray,
   sql,
 } from "drizzle-orm";
+import { type RerankCandidate, rerankWithLlm } from "@/lib/ai/reranker";
 import {
+  type AnchorWeight,
   aggregateGraphScores,
+  applyNegativeSignals,
   type CandidateSignals,
   diversify,
   type EdgeContribution,
+  mergeAnchors,
   scoreCandidates,
 } from "@/lib/recommendation-engine";
 import { getStatisticsExclusions } from "./exclusions";
+import { getChatConfig } from "./server";
 import { getSimilarSeries } from "./similar-series-statistics";
 import type {
   RecommendationCardItem,
@@ -93,6 +98,82 @@ async function getHiddenItemIds(
   return rows.map((r) => r.itemId);
 }
 
+const RECENT_MOOD_DAYS = 14;
+const RECENT_MOOD_MAX_ANCHORS = 6;
+
+/**
+ * "Current mood" anchors: the titles the user watched most in the last
+ * couple of weeks, weighted just above the nightly profile anchors so the
+ * row follows what the user is into right now without waiting for the
+ * next recommendation-sync run.
+ */
+async function getRecentMoodAnchors(
+  serverId: number,
+  userId: string,
+): Promise<AnchorWeight[]> {
+  const rows = await db.execute(sql`
+    SELECT
+      CASE WHEN i.type = 'Episode' THEN i.series_id ELSE i.id END AS id,
+      SUM(s.play_duration) AS watch_seconds
+    FROM sessions s
+    JOIN items i ON i.id = s.item_id
+    WHERE s.server_id = ${serverId}
+      AND s.user_id = ${userId}
+      AND s.play_duration IS NOT NULL AND s.play_duration > 0
+      AND s.start_time > now() - make_interval(days => ${RECENT_MOOD_DAYS})
+      AND i.type IN ('Movie', 'Episode', 'Series')
+    GROUP BY 1
+    HAVING CASE WHEN i.type = 'Episode' THEN i.series_id ELSE i.id END IS NOT NULL
+    ORDER BY SUM(s.play_duration) DESC
+    LIMIT ${RECENT_MOOD_MAX_ANCHORS}
+  `);
+  return (rows as unknown as Array<{ id: string }>).map((row, index) => ({
+    itemId: row.id,
+    // Slightly above profile anchors (which are <= 1), fading with rank
+    weight: 1.1 - index * 0.05,
+  }));
+}
+
+/**
+ * Negative feedback: for every title the user hid, collect the graph
+ * neighbourhood so candidates strongly connected to hidden titles can be
+ * penalized, not just the hidden titles themselves filtered.
+ */
+async function getNegativeSignalScores(
+  serverId: number,
+  hiddenIds: string[],
+): Promise<Map<string, number>> {
+  if (hiddenIds.length === 0) return new Map();
+  const rows = await db
+    .select({
+      targetItemId: itemEdges.targetItemId,
+      edgeType: itemEdges.edgeType,
+      weight: itemEdges.weight,
+    })
+    .from(itemEdges)
+    .where(
+      and(
+        eq(itemEdges.serverId, serverId),
+        inArray(itemEdges.sourceItemId, hiddenIds),
+      ),
+    );
+
+  const scores = new Map<string, number>();
+  for (const row of rows) {
+    const typeWeight =
+      row.edgeType === "co_watched"
+        ? 1.0
+        : row.edgeType === "shared_people"
+          ? 0.85
+          : 0.7;
+    scores.set(
+      row.targetItemId,
+      (scores.get(row.targetItemId) ?? 0) + row.weight * typeWeight,
+    );
+  }
+  return scores;
+}
+
 function buildReason(
   contributions: EdgeContribution[],
   anchorNames: Map<string, string>,
@@ -155,8 +236,10 @@ export async function getForYouRecommendationsForUser({
       ),
     });
 
-    const anchors = (profile?.anchorItems ?? []).filter((a) => a.weight > 0);
-    if (!profile || anchors.length === 0) {
+    const profileAnchors = (profile?.anchorItems ?? []).filter(
+      (a) => a.weight > 0,
+    );
+    if (!profile || profileAnchors.length === 0) {
       return legacyFallback({
         serverId,
         userId,
@@ -167,13 +250,22 @@ export async function getForYouRecommendationsForUser({
       });
     }
 
-    const [watchedIds, hiddenIds, { itemLibraryExclusion }] = await Promise.all(
-      [
+    const [watchedIds, hiddenIds, recentMoodAnchors, { itemLibraryExclusion }] =
+      await Promise.all([
         getWatchedTitleIds(serverId, userId),
         getHiddenItemIds(serverId, userId),
+        getRecentMoodAnchors(serverId, userId),
         getStatisticsExclusions(serverId, viewerUserId),
-      ],
+      ]);
+
+    // Session-aware freshness: blend the nightly profile anchors with what
+    // the user has actually been watching in the last two weeks
+    const anchors = mergeAnchors(
+      profileAnchors.map((a) => ({ itemId: a.itemId, weight: a.weight })),
+      recentMoodAnchors,
     );
+
+    const negativeScores = await getNegativeSignalScores(serverId, hiddenIds);
 
     const anchorIds = anchors.map((a) => a.itemId);
     const tasteVec = profile.tasteEmbedding;
@@ -230,7 +322,7 @@ export async function getForYouRecommendationsForUser({
         edgeType: row.edgeType,
         weight: row.weight,
       })),
-      anchors.map((a) => ({ itemId: a.itemId, weight: a.weight })),
+      anchors,
     );
 
     // Collect per-candidate metadata (card, best semantic score, people labels)
@@ -270,11 +362,14 @@ export async function getForYouRecommendationsForUser({
       });
     }
 
-    const scored = scoreCandidates(signals, {
-      genreWeights: profile.genreWeights,
-      decadeWeights: profile.decadeWeights,
-      ratingAffinity: profile.ratingAffinity,
-    }).sort((a, b) => b.score - a.score);
+    const scored = applyNegativeSignals(
+      scoreCandidates(signals, {
+        genreWeights: profile.genreWeights,
+        decadeWeights: profile.decadeWeights,
+        ratingAffinity: profile.ratingAffinity,
+      }),
+      negativeScores,
+    ).sort((a, b) => b.score - a.score);
 
     const pool = scored.slice(0, CANDIDATE_POOL);
     const diversified = diversify(
@@ -431,4 +526,145 @@ export async function getTasteProfileSummaryForUser({
       .filter((n): n is string => n !== undefined),
     computedAt: profile.computedAt.toISOString(),
   };
+}
+
+const REFINED_TTL_MS = 3 * 60 * 60 * 1000;
+const REFINED_CACHE_MAX_ENTRIES = 500;
+const REFINED_CANDIDATE_COUNT = 30;
+const REFINED_MIN_CANDIDATES = 8;
+
+interface RefinedCacheEntry {
+  expiresAt: number;
+  items: ForYouRecommendation[];
+}
+
+// In-process cache so the LLM is consulted at most once per user/row/TTL.
+// Streamystats runs as a single Next.js instance, so this needs no
+// external store; entries are also re-filtered against fresh hide state.
+const refinedCache = new Map<string, RefinedCacheEntry>();
+
+export interface RefinedForYouResult {
+  refined: boolean;
+  items: ForYouRecommendation[];
+}
+
+/**
+ * LLM-refined version of the For You row: the engine retrieves and scores
+ * candidates, then the server's configured chat model re-orders the top of
+ * the row and writes taste-aware explanations. Returns refined=false (and
+ * no items) whenever no chat model is configured or the model fails, so
+ * callers simply keep the engine order.
+ *
+ * Trusted internal API: callers are responsible for authorizing `userId`.
+ */
+export async function getRefinedForYouForUser({
+  serverId,
+  userId,
+  mediaType,
+  limit = 20,
+  viewerUserId,
+}: {
+  serverId: number;
+  userId: string;
+  mediaType: "Movie" | "Series";
+  limit?: number;
+  viewerUserId?: string;
+}): Promise<RefinedForYouResult> {
+  try {
+    const chatConfig = await getChatConfig({ serverId });
+    if (!chatConfig?.provider || !chatConfig.model) {
+      return { refined: false, items: [] };
+    }
+
+    const cacheKey = `${serverId}:${userId}:${mediaType}:${limit}`;
+    const cached = refinedCache.get(cacheKey);
+    let items = cached && cached.expiresAt > Date.now() ? cached.items : null;
+
+    if (!items) {
+      const candidates = await getForYouRecommendationsForUser({
+        serverId,
+        userId,
+        mediaType,
+        limit: Math.max(REFINED_CANDIDATE_COUNT, limit + 10),
+        viewerUserId,
+      });
+      if (candidates.length < REFINED_MIN_CANDIDATES) {
+        return { refined: false, items: [] };
+      }
+
+      const profile = await getTasteProfileSummaryForUser({ serverId, userId });
+      const rerankCandidates: RerankCandidate[] = candidates.map((c) => ({
+        id: c.item.id,
+        title: c.item.name,
+        year: c.item.productionYear,
+        genres: c.item.genres,
+        rating: c.item.communityRating,
+        engineReason: c.reason,
+      }));
+
+      const result = await rerankWithLlm({
+        config: {
+          provider: chatConfig.provider,
+          baseUrl: chatConfig.baseUrl || null,
+          apiKey: chatConfig.apiKey ?? null,
+          model: chatConfig.model,
+        },
+        candidates: rerankCandidates,
+        profile: {
+          topGenres: Object.entries(profile?.genreWeights ?? {})
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 6)
+            .map(([genre]) => genre),
+          favouritePeople: (profile?.peopleAffinities ?? [])
+            .slice(0, 5)
+            .map((p) => p.name),
+          recentTitles: (profile?.anchorTitles ?? []).slice(0, 5),
+          noveltyScore: profile?.noveltyScore ?? null,
+        },
+        mediaType,
+        keep: limit,
+      });
+      if (!result.ok) {
+        return { refined: false, items: [] };
+      }
+
+      const byId = new Map(candidates.map((c) => [c.item.id, c]));
+      const pickedIds = new Set(result.picks.map((p) => p.id));
+      const ordered: ForYouRecommendation[] = [];
+      for (const pick of result.picks) {
+        const candidate = byId.get(pick.id);
+        if (candidate) {
+          ordered.push({
+            ...candidate,
+            reason: pick.reason || candidate.reason,
+          });
+        }
+      }
+      // Backfill with the engine order if the model returned fewer picks
+      for (const candidate of candidates) {
+        if (ordered.length >= limit) break;
+        if (!pickedIds.has(candidate.item.id)) ordered.push(candidate);
+      }
+      items = ordered.slice(0, limit);
+
+      if (refinedCache.size >= REFINED_CACHE_MAX_ENTRIES) {
+        refinedCache.clear();
+      }
+      refinedCache.set(cacheKey, {
+        items,
+        expiresAt: Date.now() + REFINED_TTL_MS,
+      });
+    }
+
+    // Re-filter against hide state so a cached row never resurfaces an
+    // item the user hid after the cache entry was written
+    const hidden = new Set(await getHiddenItemIds(serverId, userId));
+    return {
+      refined: true,
+      items: items.filter((item) => !hidden.has(item.item.id)),
+    };
+  } catch (error) {
+    console.error("Error refining recommendations:", error);
+    return { refined: false, items: [] };
+  }
 }
