@@ -255,3 +255,58 @@ export function diversify<T extends { score: number }>(
 
   return picked;
 }
+
+/**
+ * Apply negative feedback to scored candidates.
+ *
+ * `negativeScores` maps candidate ids to a raw "closeness to hidden items"
+ * score (graph edges from titles the user explicitly hid). The penalty is
+ * multiplicative and normalized against the strongest negative in the batch,
+ * so hiding one film dampens its whole neighbourhood without ever zeroing
+ * a candidate out completely.
+ */
+export function applyNegativeSignals(
+  candidates: ScoredCandidate[],
+  negativeScores: Map<string, number>,
+  maxPenalty = 0.7,
+): ScoredCandidate[] {
+  if (negativeScores.size === 0) return candidates;
+  const maxNegative = Math.max(...negativeScores.values(), 0);
+  if (maxNegative <= 0) return candidates;
+
+  return candidates.map((candidate) => {
+    const negative = negativeScores.get(candidate.itemId);
+    if (negative === undefined || negative <= 0) return candidate;
+    const penalty = maxPenalty * (negative / maxNegative);
+    return { ...candidate, score: candidate.score * (1 - penalty) };
+  });
+}
+
+/**
+ * Merge the nightly profile anchors with query-time "recent mood" anchors
+ * (titles watched in the last days). Recent anchors win on duplicates via
+ * max-weight, and the result is capped to the strongest `maxAnchors`.
+ */
+export function mergeAnchors(
+  profileAnchors: AnchorWeight[],
+  recentAnchors: AnchorWeight[],
+  maxAnchors = 16,
+): AnchorWeight[] {
+  const merged = new Map<string, number>();
+  for (const anchor of profileAnchors) {
+    merged.set(anchor.itemId, anchor.weight);
+  }
+  for (const anchor of recentAnchors) {
+    const existing = merged.get(anchor.itemId);
+    merged.set(
+      anchor.itemId,
+      existing === undefined
+        ? anchor.weight
+        : Math.max(existing, anchor.weight),
+    );
+  }
+  return [...merged.entries()]
+    .map(([itemId, weight]) => ({ itemId, weight }))
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, maxAnchors);
+}

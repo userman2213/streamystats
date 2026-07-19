@@ -5,10 +5,12 @@ import "server-only";
 import {
   type ForYouRecommendation,
   getForYouRecommendationsForUser,
+  getRefinedForYouForUser,
   getTasteProfileSummaryForUser,
+  type RefinedForYouResult,
   type TasteProfileSummary,
 } from "./recommendations-core";
-import { getMe, isUserAdmin } from "./users";
+import { getMe, getViewerUserId, isUserAdmin } from "./users";
 
 /**
  * Session-guarded server action for the web UI.
@@ -56,4 +58,32 @@ export async function getTasteProfileSummary({
   const me = await getMe();
   if (!me || me.serverId !== serverId) return null;
   return getTasteProfileSummaryForUser({ serverId, userId: me.id });
+}
+
+/**
+ * Session-guarded LLM refinement of the current user's For You row.
+ * Returns refined=false when no chat model is configured or the model
+ * fails; the client then keeps the engine ordering.
+ */
+export async function refineForYouRecommendations({
+  serverId,
+  mediaType,
+  limit = 20,
+}: {
+  serverId: number;
+  mediaType: "Movie" | "Series";
+  limit?: number;
+}): Promise<RefinedForYouResult> {
+  const me = await getMe();
+  if (!me || me.serverId !== serverId) {
+    return { refined: false, items: [] };
+  }
+  const viewerUserId = await getViewerUserId();
+  return getRefinedForYouForUser({
+    serverId,
+    userId: me.id,
+    mediaType,
+    limit,
+    viewerUserId,
+  });
 }

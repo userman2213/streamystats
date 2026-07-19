@@ -118,11 +118,19 @@ export function RecommendationsSection({
           setIsLoading(true);
           fetchNextPage(items.length)
             .then((newItems) => {
-              if (newItems.length === 0) {
-                setHasMore(false);
-              } else {
-                setItems((prev) => [...prev, ...newItems]);
-              }
+              // Deduplicate: an LLM-refined first page can overlap with the
+              // engine-ordered pages fetched on scroll
+              setItems((prev) => {
+                const existing = new Set(prev.map((r) => r.item.id));
+                const unseen = newItems.filter(
+                  (r) => r.item.id && !existing.has(r.item.id),
+                );
+                if (newItems.length === 0 || unseen.length === 0) {
+                  setHasMore(false);
+                  return prev;
+                }
+                return [...prev, ...unseen];
+              });
             })
             .catch((error) => {
               console.error("Error fetching next page:", error);
